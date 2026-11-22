@@ -14,7 +14,8 @@
   split = 直连流量走「默认出口」，代理流量（所有节点）走「Clash 出口」。两个出口各是哪块网卡由你选。
 
   会改什么：Clash Verge 的 config.yaml / verge.yaml / profiles.yaml / 全局扩展覆写配置，新增「组合配置」，
-  系统时区与自动对时；选了双出口时再改两块网卡的跃点数、关 Clash 出口那块网卡的 IPv6。改之前全部备份到 Clash Verge 配置目录下的 setup-backup-时间 目录。
+  系统时区与自动对时，并关闭物理网卡的 IPv6（防 IPv6 流量绕过 Clash 导致卡顿和泄露）；选了双出口时再改两块网卡的跃点数。
+  改之前全部备份到 Clash Verge 配置目录下的 setup-backup-时间 目录。
   不会做：禁用任何网卡、改订阅链接、替你选 AI 节点。
 #>
 [CmdletBinding()]
@@ -159,9 +160,21 @@ function Test-SplitExit([string]$clashIf, [string]$defaultIf) {
 function Invoke-Verify {
     $script:ok = 0; $script:bad = 0
     function Mark([string]$state, [string]$what, [string]$detail) {
-        $color = @{ '通过' = 'Green'; '失败' = 'Red'; '跳过' = 'Yellow'; '信息' = 'Cyan' }[$state]
+        $color = @{ '通过' = 'Green'; '失败' = 'Red'; '跳过' = 'Yellow'; '提醒' = 'Yellow'; '信息' = 'Cyan' }[$state]
         Write-Host ("[{0}] {1}  {2}" -f $state, $what, $detail) -ForegroundColor $color
         if ($state -eq '通过') { $script:ok++ } elseif ($state -eq '失败') { $script:bad++ }
+    }
+    function Check-ChromiumBrowser([string]$name, [string]$statePath, [string]$scheme) {
+        if (-not (Test-Path -LiteralPath $statePath)) { return }
+        try {
+            $j = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $labs = if ($j.browser -and $j.browser.enabled_labs_experiments) { @($j.browser.enabled_labs_experiments) } else { @() }
+            if ($labs -contains 'enable-quic@2') { Mark '通过' "$name 已关 HTTP/3（QUIC）" 'enable-quic = Disabled' }
+            else { Mark '提醒' "$name 还没关 HTTP/3（QUIC）" "TUN 会静默丢弃 UDP 443，不关会导致切任何节点都卡：打开 ${scheme}://flags/#enable-quic 设为 Disabled 并重启浏览器" }
+            $doh = if ($j.dns_over_https -and $j.dns_over_https.mode) { [string]$j.dns_over_https.mode } else { 'automatic' }
+            if ($doh -eq 'off') { Mark '通过' "$name 已关安全 DNS（DoH）" 'dns_over_https = off' }
+            else { Mark '提醒' "$name 还没关安全 DNS（DoH）" "当前模式为 $doh，会绕过 Clash 的 Fake-IP：到浏览器设置关闭「使用安全 DNS」" }
+        } catch {}
     }
     function Trace([string]$u) { $t = curl.exe -s -m 15 $u; if ($t) { $h = @{}; foreach ($l in ($t -split "`n")) { if ($l -match '^(ip|loc)=(.*)$') { $h[$Matches[1]] = $Matches[2].Trim() } }; return $h }; return $null }
     $dev = Select-String -LiteralPath (Join-Path $VergeDir 'config.yaml') -Pattern '^  device:\s*(\S+)' | Select-Object -First 1
@@ -219,6 +232,15 @@ function Invoke-Verify {
     if ($u.Count -eq 0) { Mark '跳过' 'DNS 只监听本机' 'Clash 没在运行' }
     elseif (@($u | Where-Object { $_.LocalAddress -ne '127.0.0.1' }).Count -eq 0) { Mark '通过' 'DNS 只监听本机' '只有 127.0.0.1:1053' }
     else { Mark '失败' 'DNS 只监听本机' (($u | ForEach-Object LocalAddress) -join ', ') }
+    if (Test-Path (Join-Path $VergeDir 'config.yaml')) {
+        if (Select-String -LiteralPath (Join-Path $VergeDir 'config.yaml') -SimpleMatch 'tcp://any:53' -Quiet) {
+            Mark '通过' 'TUN DNS 劫持含 TCP 53' 'any:53 + tcp://any:53'
+        } else {
+            Mark '提醒' 'TUN DNS 劫持缺 TCP 53' 'config.yaml 缺少 tcp://any:53，重新运行脚本可补上'
+        }
+    }
+    Check-ChromiumBrowser 'Chrome' "$env:LOCALAPPDATA\Google\Chrome\User Data\Local State" 'chrome'
+    Check-ChromiumBrowser 'Edge' "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Local State" 'edge'
     Say ''
     Say "通过 $script:ok 项，失败 $script:bad 项。失效保护需要手动测：AI 组临时选「拒绝」，claude.ai 应该打不开。" $(if ($script:bad) { 'Red' } else { 'Green' })
 }
@@ -386,7 +408,8 @@ rule-providers:
     proxy: 其他
 
 rules:
-  # HTTP/3（QUIC）一律拒绝，浏览器会立刻改用普通 HTTPS：出口更一致，域名识别更准。
+  # HTTP/3（QUIC）一律拒绝，强制改用普通 HTTPS：出口更一致，域名识别更准。
+  # 注意：TUN 对 UDP 的 REJECT 不会回 ICMP 拒绝包，浏览器也要顺手关掉 QUIC，否则每次连接会等超时才回退。
   - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT
   # Google 整个走「其他」，包括 Gemini、AI Studio 和 Google 登录：Google 按账号判断地区，同一个账号的请求要从同一个出口出去；
   # 上游还把 Google 一部分国内能连的域名放进了直连，会带着账号 Cookie 暴露真实 IP。所以「其他」层要选一个能正常用 Google 的节点。
@@ -435,6 +458,7 @@ dns:
     - 'time.*.com'
     - 'time.*.gov'
     - 'time.*.edu.cn'
+    - 'time.apple.com'
     - 'time.*.apple.com'
     - 'time1.*.com'
     - 'time2.*.com'
@@ -454,9 +478,10 @@ dns:
     - '*.time.edu.cn'
     - '*.ntp.org.cn'
     - 'time1.cloud.tencent.com'
-    # Windows 联网检测：拿到假 IP 会让任务栏显示「无 Internet」
+    # Windows / macOS 联网检测：拿到假 IP 会让系统误判「无 Internet」或反复弹认证页
     - '*.msftconnecttest.com'
     - '*.msftncsi.com'
+    - 'captive.apple.com'
     # STUN：网页通话、P2P 穿透要用真实地址
     - 'stun.*.*'
     - 'stun.*.*.*'
@@ -635,6 +660,8 @@ try {
         default { '否' }
     }
     Say ("  时区：{0}；广告拦截默认：{1}；双出口：{2}" -f $TimeZone, $AdBlock, $dualText)
+    if ($SkipSystem) { Say '  系统设置：按 -SkipSystem 不动' }
+    else { Say '  系统设置：设时区与对时，并关闭物理网卡的 IPv6（防绕过 Clash 泄露与超时卡顿）' }
     if (-not $DryRun -and -not $Yes) {
         Say '  执行时需要先退出 Clash Verge；退出期间 TUN 会断开，所有流量（包括 AI）都会直连。' 'Yellow'
         if ((Ask-Choice '确认开始？y / n' @('yes', 'no') 'y') -ne 'yes') { Say '已取消，什么都没改。'; Pause-End; return }
@@ -648,7 +675,7 @@ try {
         $prov += "  $(YQ $s.Key):`n    type: file`n    path: $(YQ "./profiles/$($s.File)")`n    interval: 3600`n    exclude-filter: $(YQ $InfoFilter)`n    exclude-type: 'direct'`n    override:`n      additional-prefix: $(YQ "[$($s.Key)] ")`n$bind"
     }
     $use = '[' + (($chosen | ForEach-Object { YQ $_.Key }) -join ', ') + ']'
-    $privateDns = if ($DualExit -ne 'no') { YQ $LanDns } else { "'system'" }
+    $privateDns = if ($DualExit -ne 'no') { YQ $LanDns } else { "'system', 'https://223.5.5.5/dns-query', 'https://1.12.12.12/dns-query'" }
     $adProxies = if ($AdBlock -eq 'on') { '[REJECT, PASS]' } else { '[PASS, REJECT]' }
     $profileText = $Template.Replace('{{PROVIDERS}}', $prov).Replace('{{USE}}', $use).Replace('{{AI_FILTER}}', (YQ ($aiParts -join '|'))).Replace('{{AI_EXCLUDE}}', (YQ $BlockAI)).Replace('{{AD_PROXIES}}', $adProxies).Replace('{{PRIVATE_DNS}}', $privateDns) + "`n"
 
@@ -698,14 +725,31 @@ try {
         Say '已开启自动对时（阿里云、微软 NTP）'
     } catch { Say "自动对时没设好：$($_.Exception.Message)" 'Yellow' } }
 
+    # 系统：关闭物理网卡的 IPv6（组合配置 ipv6: false，TUN 不接管 ::/0，留着 IPv6 会绕过 Clash）
+    if (-not $SkipSystem) {
+        $v6Targets = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | ForEach-Object Name)
+        if ($DualExit -ne 'no' -and $ClashAdapter -and ($v6Targets -notcontains $ClashAdapter)) { $v6Targets += $ClashAdapter }
+        $v6Closed = @()
+        foreach ($nic in $v6Targets) {
+            $b = Get-NetAdapterBinding -Name $nic -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+            if ($b -and $b.Enabled) {
+                try {
+                    Disable-NetAdapterBinding -Name $nic -ComponentID ms_tcpip6 -Confirm:$false
+                    $v6Closed += $nic
+                } catch { Say "没关掉 $nic 的 IPv6：$($_.Exception.Message)" 'Yellow' }
+            }
+        }
+        if ($v6Closed.Count) { Say ("已关闭物理网卡 IPv6：{0}" -f ($v6Closed -join '、')) }
+        else { Say '物理网卡的 IPv6 已经关闭' }
+    }
+
     # 系统：双出口
     if ($DualExit -ne 'no' -and -not $SkipSystem) {
         foreach ($fam in 'IPv4', 'IPv6') {
             Set-NetIPInterface -InterfaceAlias $DefaultAdapter -AddressFamily $fam -AutomaticMetric Disabled -InterfaceMetric 1 -ErrorAction SilentlyContinue
             Set-NetIPInterface -InterfaceAlias $ClashAdapter -AddressFamily $fam -AutomaticMetric Disabled -InterfaceMetric 500 -ErrorAction SilentlyContinue
         }
-        Disable-NetAdapterBinding -Name $ClashAdapter -ComponentID ms_tcpip6 -Confirm:$false
-        Say "双出口：跃点数 $DefaultAdapter=1、$ClashAdapter=500，已关闭 $ClashAdapter 的 IPv6"
+        Say "双出口：跃点数 $DefaultAdapter=1、$ClashAdapter=500"
     }
 
     # Clash Verge 基础设置：config.yaml
@@ -722,9 +766,26 @@ try {
         for ($i = $t + 1; $i -lt $l.Count -and $l[$i] -match '^\s'; $i++) { if ($l[$i] -match "^  ${k}:") { $l[$i] = "  ${k}: $v"; return } }
         $l.Insert($t + 1, "  ${k}: $v")
     }
+    function Set-TunList([System.Collections.Generic.List[string]]$l, [string]$k, [string[]]$vals) {
+        $t = $l.IndexOf('tun:')
+        if ($t -lt 0) { $t = $l.IndexOf('tun: {}'); if ($t -ge 0) { $l[$t] = 'tun:' } }
+        if ($t -lt 0) { $l.Add('tun:'); $t = $l.Count - 1 }
+        $items = @("  ${k}:") + @($vals | ForEach-Object { "  - $_" })
+        for ($i = $t + 1; $i -lt $l.Count -and $l[$i] -match '^\s'; $i++) {
+            if ($l[$i] -match "^  ${k}:") {
+                $end = $i + 1
+                while ($end -lt $l.Count -and $l[$end] -match '^\s+-\s') { $end++ }
+                $l.RemoveRange($i, $end - $i)
+                $l.InsertRange($i, [string[]]$items)
+                return
+            }
+        }
+        $l.InsertRange($t + 1, [string[]]$items)
+    }
     Set-TopKey $cfg 'ipv6' 'false'
     Set-TunKey $cfg 'auto-route' 'true'
     Set-TunKey $cfg 'strict-route' 'true'
+    Set-TunList $cfg 'dns-hijack' @('any:53', 'tcp://any:53')
     Set-TunKey $cfg 'auto-detect-interface' $(if ($DualExit -eq 'all') { 'false' } else { 'true' })
     Write-Text $cfgPath (($cfg -join "`n") + "`n")
 
@@ -795,7 +856,8 @@ try {
     Say '     「其他」组也要选好：Google（包括 Gemini）都走它，选一个在支持 Gemini 的地区、能正常打开 Google 的节点。'
     Say '  3. 回首页打开「虚拟网卡模式」（TUN；第一次会要求安装服务）。'
     Say "  然后运行  powershell -ExecutionPolicy Bypass -File .\Setup-ClashAI.ps1 -Verify  检查。"
-    Say "  恢复原样：退出 Clash Verge，把 $backup 里的文件拷回 $VergeDir（网卡原来的跃点数和 IPv6 设置记在同目录的两个 json 里）。"
+    Say "  浏览器也要关掉 HTTP/3（chrome://flags/#enable-quic → Disabled）和安全 DNS，不然会出现切任何节点都卡或绕过分流。" 'Yellow'
+    Say "  恢复原样：退出 Clash Verge，把 $backup 里的文件拷回 $VergeDir（网卡原来的跃点数和 IPv6 设置记在同目录的两个 json 里；恢复 IPv6 用 Enable-NetAdapterBinding -Name '网卡名' -ComponentID ms_tcpip6）。"
     Pause-End
 } catch {
     Say ''

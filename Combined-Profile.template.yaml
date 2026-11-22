@@ -179,7 +179,8 @@ rule-providers:
     proxy: 其他
 
 rules:
-  # HTTP/3（QUIC）一律拒绝，浏览器会立刻改用普通 HTTPS：出口更一致，域名识别更准。
+  # HTTP/3（QUIC）一律拒绝，强制改用普通 HTTPS：出口更一致，域名识别更准。
+  # 注意：TUN 对 UDP 的 REJECT 不会回 ICMP 拒绝包，浏览器也要顺手关掉 QUIC，否则每次连接会等超时才回退。
   - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT
   # Google 整个走「其他」，包括 Gemini、AI Studio 和 Google 登录：Google 按账号判断地区，同一个账号的请求要从同一个出口出去；
   # 上游还把 Google 一部分国内能连的域名放进了直连，会带着账号 Cookie 暴露真实 IP。所以「其他」层要选一个能正常用 Google 的节点。
@@ -228,6 +229,7 @@ dns:
     - 'time.*.com'
     - 'time.*.gov'
     - 'time.*.edu.cn'
+    - 'time.apple.com'
     - 'time.*.apple.com'
     - 'time1.*.com'
     - 'time2.*.com'
@@ -247,9 +249,10 @@ dns:
     - '*.time.edu.cn'
     - '*.ntp.org.cn'
     - 'time1.cloud.tencent.com'
-    # Windows 联网检测：拿到假 IP 会让任务栏显示「无 Internet」
+    # Windows / macOS 联网检测：拿到假 IP 会让系统误判「无 Internet」或反复弹认证页
     - '*.msftconnecttest.com'
     - '*.msftncsi.com'
+    - 'captive.apple.com'
     # STUN：网页通话、P2P 穿透要用真实地址
     - 'stun.*.*'
     - 'stun.*.*.*'
@@ -271,8 +274,8 @@ dns:
     'rule-set:ai-inline': ['https://1.1.1.1/dns-query#AI', 'https://8.8.8.8/dns-query#AI']
     'geosite:anthropic': ['https://1.1.1.1/dns-query#AI', 'https://8.8.8.8/dns-query#AI']
     'rule-set:ai-list': ['https://1.1.1.1/dns-query#AI', 'https://8.8.8.8/dns-query#AI']
-    # 2. 局域网、私有域名 → 系统 DNS（路由器或热点分配的）
-    'rule-set:loyal-private': ['system']
+    # 2. 局域网、私有域名 → 系统 DNS（带国内加密 DNS 兜底，避免 macOS TUN 下 system 解析器空列表报错）
+    'rule-set:loyal-private': ['system', 'https://223.5.5.5/dns-query', 'https://1.12.12.12/dns-query']
     # 3. 国内域名 → 国内加密 DNS 直连
     'rule-set:loyal-direct': ['https://223.5.5.5/dns-query', 'https://1.12.12.12/dns-query']
 

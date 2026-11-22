@@ -18,7 +18,8 @@
 #   split = 直连流量走「默认出口」，代理流量（所有节点）走「Clash 出口」。两个出口各是哪块网卡由你选。
 #
 # 会改什么：Clash Verge 的 config.yaml / verge.yaml / profiles.yaml / 全局扩展覆写配置，新增「组合配置」；
-# 系统时区与自动对时；选了双出口时再用 NetworkManager 关掉 Clash 出口那条连接的 IPv6、调高它的跃点数。
+# 系统时区与自动对时，并用 NetworkManager 关闭活动物理网卡连接的 IPv6（防 IPv6 流量绕过 Clash 导致卡顿和泄露）；
+# 选了双出口时再调高 Clash 出口的跃点数。
 # 改之前全部备份到 Clash Verge 配置目录下的 setup-backup-时间 目录。
 # 不会做：禁用任何网卡、改订阅链接、替你选 AI 节点。
 
@@ -146,6 +147,27 @@ set_tun_key() {
     done
     _tn_arr=("${_tn_arr[@]:0:t+1}" "  $k: $v" "${_tn_arr[@]:t+1}")
 }
+set_tun_list() {
+    local -n _tl_arr=$1; local k=$2 i t=-1 end v
+    shift 2
+    local -a items=()
+    for v in "$@"; do items+=("  - $v"); done
+    for i in "${!_tl_arr[@]}"; do [[ ${_tl_arr[i]} == 'tun:' ]] && { t=$i; break; }; done
+    if (( t < 0 )); then for i in "${!_tl_arr[@]}"; do [[ ${_tl_arr[i]} == 'tun: {}' ]] && { _tl_arr[i]='tun:'; t=$i; break; }; done; fi
+    if (( t < 0 )); then _tl_arr+=('tun:'); t=$(( ${#_tl_arr[@]} - 1 )); fi
+    for (( i = t + 1; i < ${#_tl_arr[@]}; i++ )); do
+        [[ ${_tl_arr[i]} == [[:space:]]* ]] || break
+        if [[ ${_tl_arr[i]} == "  $k:"* ]]; then
+            end=$(( i + 1 ))
+            while (( end < ${#_tl_arr[@]} )) && [[ ${_tl_arr[end]} =~ ^[[:space:]]+-[[:space:]] ]]; do
+                end=$(( end + 1 ))
+            done
+            _tl_arr=("${_tl_arr[@]:0:i}" "  $k:" "${items[@]}" "${_tl_arr[@]:end}")
+            return
+        fi
+    done
+    _tl_arr=("${_tl_arr[@]:0:t+1}" "  $k:" "${items[@]}" "${_tl_arr[@]:t+1}")
+}
 
 # ───────────── 订阅与节点 ─────────────
 # 订阅列表：Clash Verge 的 profiles.yaml 里的条目（SUB_* 是同下标的几个数组）
@@ -215,11 +237,40 @@ test_split_exit() {
     done
 }
 verify() {
-    local ok=0 bad=0 c a d n l tun_if mode='' clash_if='' def_if='' before=0 dev listen sent w gl v6 dual_text=否
+    local ok=0 bad=0 c a d n l tun_if mode='' clash_if='' def_if='' before=0 dev listen sent w gl v6 v6rt dual_text=否
     mark() {
         local color
-        case $1 in 通过) color=$GREEN; ok=$(( ok + 1 )) ;; 失败) color=$RED; bad=$(( bad + 1 )) ;; 跳过) color=$YELLOW ;; *) color=$CYAN ;; esac
+        case $1 in 通过) color=$GREEN; ok=$(( ok + 1 )) ;; 失败) color=$RED; bad=$(( bad + 1 )) ;; 跳过|提醒) color=$YELLOW ;; *) color=$CYAN ;; esac
         say "[$1] $2  $3" "$color"
+    }
+    check_chromium_browser() {
+        local name=$1 state=$2 scheme=$3 res q d
+        [[ -f $state ]] || return 0
+        if command -v python3 >/dev/null 2>&1; then
+            res=$(python3 -c '
+import json, sys
+j = json.load(sys.stdin)
+labs = (j.get("browser") or {}).get("enabled_labs_experiments") or []
+q = "off" if "enable-quic@2" in labs else "on"
+d = (j.get("dns_over_https") or {}).get("mode") or "automatic"
+print(q, d)
+' < "$state" 2>/dev/null) || return 0
+        elif command -v perl >/dev/null 2>&1; then
+            res=$(perl -MJSON::PP -0777 -e '
+                my $j = eval { decode_json(<STDIN>) } or exit 1;
+                my $labs = $j->{browser}{enabled_labs_experiments} || [];
+                my $q = (grep { $_ eq "enable-quic\@2" } @$labs) ? "off" : "on";
+                my $d = $j->{dns_over_https}{mode} // "automatic";
+                print "$q $d\n";
+            ' < "$state" 2>/dev/null) || return 0
+        else
+            return 0
+        fi
+        q=${res%% *}; d=${res#* }
+        if [[ $q == off ]]; then mark 通过 "${name} 已关 HTTP/3（QUIC）" 'enable-quic = Disabled'
+        else mark 提醒 "${name} 还没关 HTTP/3（QUIC）" "TUN 会静默丢弃 UDP 443，不关会导致切任何节点都卡：打开 ${scheme}://flags/#enable-quic 设为 Disabled 并重启浏览器"; fi
+        if [[ $d == off ]]; then mark 通过 "${name} 已关安全 DNS（DoH）" 'dns_over_https = off'
+        else mark 提醒 "${name} 还没关安全 DNS（DoH）" "当前模式为 ${d}，会绕过 Clash 的 Fake-IP：到浏览器设置关闭「使用安全 DNS」"; fi
     }
     trace() { curl -s -m 15 "$1" 2>/dev/null; }
     kv() { sed -n "s/^$1=//p" <<< "$2" | head -1; }
@@ -286,18 +337,31 @@ verify() {
             fi
         fi
     fi
-    # 组合配置只走 IPv4：物理网卡上有公网 IPv6 时，IPv6 流量和网页的 WebRTC 可能绕过 Clash
-    v6=''
+    # 组合配置只走 IPv4：物理网卡上有公网 IPv6 或 IPv6 默认路由时，流量和 WebRTC 可能绕过 Clash
+    v6='' v6rt=''
     for d in /sys/class/net/*; do
         n=${d##*/}
         [[ -e $d/device ]] && ip -6 -o addr show dev "$n" scope global 2>/dev/null | grep -q . && { v6=$n; break; }
     done
+    v6rt=$(ip -6 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+    [[ -n $tun_if && $v6rt == "$tun_if" ]] && v6rt=''
     if [[ -n $v6 ]]; then mark 失败 '没有绕过 Clash 的 IPv6' "$v6 有公网 IPv6，IPv6 流量可能绕过 Clash。关掉它（NetworkManager：nmcli connection modify 连接名 ipv6.method disabled）"
-    else mark 通过 '没有绕过 Clash 的 IPv6' '物理网卡上都没有公网 IPv6'; fi
+    elif [[ -n $v6rt ]]; then mark 失败 '没有绕过 Clash 的 IPv6' "存在经 $v6rt 出去的 IPv6 默认路由，可能绕过 Clash。请关掉 $v6rt 的 IPv6"
+    else mark 通过 '没有绕过 Clash 的 IPv6' '物理网卡上都没有公网 IPv6，且无 IPv6 默认路由'; fi
     listen=$(ss -H -lun 2>/dev/null | awk '{print $4}' | grep -E ':1053$')
     if [[ -z $listen ]]; then mark 跳过 'DNS 只监听本机' 'Clash 没在运行'
     elif ! grep -vqE '^127\.0\.0\.1:1053$' <<< "$listen"; then mark 通过 'DNS 只监听本机' '只有 127.0.0.1:1053'
     else mark 失败 'DNS 只监听本机' "$(tr '\n' ' ' <<< "$listen")"; fi
+    if [[ -f $VERGE_DIR/config.yaml ]]; then
+        if grep -q 'tcp://any:53' "$VERGE_DIR/config.yaml" 2>/dev/null; then
+            mark 通过 'TUN DNS 劫持含 TCP 53' 'any:53 + tcp://any:53'
+        else
+            mark 提醒 'TUN DNS 劫持缺 TCP 53' 'config.yaml 缺少 tcp://any:53，重新运行脚本可补上'
+        fi
+    fi
+    check_chromium_browser Chrome "${XDG_CONFIG_HOME:-$HOME/.config}/google-chrome/Local State" chrome
+    check_chromium_browser Chromium "${XDG_CONFIG_HOME:-$HOME/.config}/chromium/Local State" chrome
+    check_chromium_browser Edge "${XDG_CONFIG_HOME:-$HOME/.config}/microsoft-edge/Local State" edge
     say ''
     say "通过 $ok 项，失败 $bad 项。失效保护需要手动测：AI 组临时选「拒绝」，claude.ai 应该打不开。" "$( (( bad )) && echo "$RED" || echo "$GREEN")"
     (( bad == 0 ))
@@ -466,7 +530,8 @@ rule-providers:
     proxy: 其他
 
 rules:
-  # HTTP/3（QUIC）一律拒绝，浏览器会立刻改用普通 HTTPS：出口更一致，域名识别更准。
+  # HTTP/3（QUIC）一律拒绝，强制改用普通 HTTPS：出口更一致，域名识别更准。
+  # 注意：TUN 对 UDP 的 REJECT 不会回 ICMP 拒绝包，浏览器也要顺手关掉 QUIC，否则每次连接会等超时才回退。
   - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT
   # Google 整个走「其他」，包括 Gemini、AI Studio 和 Google 登录：Google 按账号判断地区，同一个账号的请求要从同一个出口出去；
   # 上游还把 Google 一部分国内能连的域名放进了直连，会带着账号 Cookie 暴露真实 IP。所以「其他」层要选一个能正常用 Google 的节点。
@@ -515,6 +580,7 @@ dns:
     - 'time.*.com'
     - 'time.*.gov'
     - 'time.*.edu.cn'
+    - 'time.apple.com'
     - 'time.*.apple.com'
     - 'time1.*.com'
     - 'time2.*.com'
@@ -534,9 +600,10 @@ dns:
     - '*.time.edu.cn'
     - '*.ntp.org.cn'
     - 'time1.cloud.tencent.com'
-    # Windows 联网检测：拿到假 IP 会让任务栏显示「无 Internet」
+    # Windows / macOS 联网检测：拿到假 IP 会让系统误判「无 Internet」或反复弹认证页
     - '*.msftconnecttest.com'
     - '*.msftncsi.com'
+    - 'captive.apple.com'
     # STUN：网页通话、P2P 穿透要用真实地址
     - 'stun.*.*'
     - 'stun.*.*.*'
@@ -627,7 +694,41 @@ set_ntp() {
         say '没找到 systemd-timesyncd 或 chrony，跳过自动对时。' "$YELLOW"
     fi
 }
-# 双出口：只动 Clash 出口那条连接（关 IPv6、跃点数调到 600），不碰默认出口
+# 组合配置只走 IPv4（ipv6: false），TUN 不接管 ::/0；关闭活动物理网卡连接的 IPv6，防绕过 Clash 导致卡顿和泄露
+disable_ipv6_network() {
+    local d n conn method changed=0 left=''
+    if command -v nmcli >/dev/null 2>&1; then
+        for d in /sys/class/net/*; do
+            [[ -e $d/device ]] || continue
+            n=${d##*/}
+            conn=$(nmcli -g GENERAL.CONNECTION device show "$n" 2>/dev/null)
+            [[ -n $conn && $conn != -- ]] || continue
+            method=$(nmcli -g ipv6.method connection show "$conn" 2>/dev/null)
+            [[ $method == disabled || $method == ignore ]] && continue
+            if "${SUDO[@]}" nmcli connection modify "$conn" ipv6.method disabled 2>/dev/null || "${SUDO[@]}" nmcli connection modify "$conn" ipv6.method ignore; then
+                "${SUDO[@]}" nmcli device reapply "$n" >/dev/null 2>&1 || say "  「$conn」的 IPv6 改动要等「$n」重新连接后生效" "$YELLOW"
+                say "已关闭「$conn」（$n）的 IPv6（防绕过 Clash 泄露与超时卡顿）"
+                changed=1
+            else
+                say "没关掉「$conn」（$n）的 IPv6，请在网络设置里手动关闭" "$YELLOW"
+            fi
+        done
+        (( changed )) || say '活动物理网卡的 NetworkManager 连接已关闭 IPv6（或当前无活动连接）'
+    else
+        say '没有 NetworkManager（nmcli），跳过自动关闭物理网卡 IPv6。' "$YELLOW"
+    fi
+    for d in /sys/class/net/*; do
+        [[ -e $d/device ]] || continue
+        n=${d##*/}
+        if ip -6 -o addr show dev "$n" scope global 2>/dev/null | grep -q .; then
+            left+="${left:+、}$n"
+        fi
+    done
+    if [[ -n $left ]]; then
+        say "注意：$left 上仍有公网 IPv6（可能未由 NetworkManager 管理），请手动关闭它的 IPv6 以防绕过 Clash。" "$YELLOW"
+    fi
+}
+# 双出口：只动 Clash 出口那条连接（跃点数调到 600，IPv6 上面已统一关闭），不碰默认出口
 set_dual_exit_network() {
     local conn mw mf
     if ! command -v nmcli >/dev/null 2>&1; then
@@ -693,7 +794,7 @@ choose_subscriptions() {
 }
 
 main() {
-    local i j p k n base kw pattern names nodes gs first existing uid file cur items_at insert_at
+    local i j p k n d base kw pattern names nodes gs first existing uid file cur items_at insert_at
     if (( EUID == 0 )) && [[ -z $CLASH_DIR ]]; then
         die '请用普通用户运行，不要加 sudo：配置在你自己的用户目录里，需要 root 的步骤脚本会自己调用 sudo。'
     fi
@@ -809,6 +910,8 @@ main() {
     [[ $DUAL_EXIT == all ]] && dual_text="all（开 TUN 时一切走 $CLASH_IF，关 TUN 走 $DEFAULT_IF；局域网 DNS $LAN_DNS）"
     [[ $DUAL_EXIT == split ]] && dual_text="split（直连走 $DEFAULT_IF，代理走 $CLASH_IF；局域网 DNS $LAN_DNS）"
     say "  时区：$TIMEZONE；广告拦截默认：$ADBLOCK；双出口：$dual_text"
+    if (( SKIP_SYSTEM )); then say '  系统设置：按 --skip-system 不动'
+    else say '  系统设置：设时区与对时，并关闭活动物理网卡连接的 IPv6（防绕过 Clash 泄露与超时卡顿）'; fi
     if (( ! DRY_RUN && ! YES )); then
         say '  执行时需要先退出 Clash Verge；退出期间 TUN 会断开，所有流量（包括 AI）都会直连。' "$YELLOW"
         ask_choice '确认开始？y / n' y yes no
@@ -828,7 +931,7 @@ main() {
         quoted+=("$(yq "$k")")
     done
     use="[$(join_by ', ' "${quoted[@]}")]"
-    if [[ $DUAL_EXIT != no ]]; then private_dns=$(yq "$LAN_DNS"); else private_dns="'system'"; fi
+    if [[ $DUAL_EXIT != no ]]; then private_dns=$(yq "$LAN_DNS"); else private_dns="'system', 'https://223.5.5.5/dns-query', 'https://1.12.12.12/dns-query'"; fi
     if [[ $ADBLOCK == on ]]; then ad_proxies='[REJECT, PASS]'; else ad_proxies='[PASS, REJECT]'; fi
     profile=$TEMPLATE
     profile=${profile//'{{PROVIDERS}}'/$prov}
@@ -883,7 +986,7 @@ main() {
     SUDO=()
     if (( ! SKIP_SYSTEM && EUID != 0 )); then
         command -v sudo >/dev/null 2>&1 || die '改时区和对时需要 sudo；只想改 Clash 就加 --skip-system。什么都没改。'
-        say '改时区、对时（和双出口的网络设置）需要 root 权限，下面可能要你输入密码。'
+        say '改时区、对时、关闭物理网卡 IPv6（或双出口网络设置）需要 root 权限，下面可能要你输入密码。'
         sudo -v || die '没拿到 sudo 权限，什么都没改。只想改 Clash 就加 --skip-system。'
         SUDO=(sudo)
     fi
@@ -901,17 +1004,22 @@ main() {
         echo "# 路由"; ip route show 2>/dev/null; ip -6 route show 2>/dev/null
         if command -v nmcli >/dev/null 2>&1; then
             echo "# NetworkManager 正在用的连接"; nmcli -t -f NAME,DEVICE,TYPE connection show --active 2>/dev/null
-            [[ -n $CLASH_IF ]] && { k=$(nmcli -g GENERAL.CONNECTION device show "$CLASH_IF" 2>/dev/null); [[ -n $k && $k != -- ]] && nmcli -g ipv6.method,ipv4.route-metric connection show "$k" 2>/dev/null | sed "s/^/$k: /"; }
+            for d in /sys/class/net/*; do
+                [[ -e $d/device ]] || continue
+                k=$(nmcli -g GENERAL.CONNECTION device show "${d##*/}" 2>/dev/null)
+                [[ -n $k && $k != -- ]] && nmcli -g ipv6.method,ipv4.route-metric connection show "$k" 2>/dev/null | sed "s/^/$k (${d##*/}): /"
+            done
         fi
     } > "$backup/system-state.txt" 2>&1
     say "已备份到 $backup" "$GREEN"
 
-    # 系统：时区、对时、双出口的网络设置
+    # 系统：时区、对时、关闭物理网卡 IPv6、双出口的网络设置
     if (( SKIP_SYSTEM )); then
         say '按 --skip-system 跳过时区、对时和网络设置' "$YELLOW"
     else
         set_timezone
         set_ntp
+        disable_ipv6_network
         if [[ $DUAL_EXIT != no ]]; then set_dual_exit_network; fi
     fi
 
@@ -921,6 +1029,7 @@ main() {
     set_top_key cfg ipv6 false
     set_tun_key cfg auto-route true
     set_tun_key cfg strict-route true
+    set_tun_list cfg dns-hijack any:53 'tcp://any:53'
     if [[ $DUAL_EXIT == all ]]; then set_tun_key cfg auto-detect-interface false; else set_tun_key cfg auto-detect-interface true; fi
     write_lines "$VERGE_DIR/config.yaml" cfg || die '写 config.yaml 失败。'
 
@@ -1000,7 +1109,8 @@ main() {
     say '     「其他」组也要选好：Google（包括 Gemini）都走它，选一个在支持 Gemini 的地区、能正常打开 Google 的节点。'
     say '  3. 回首页打开「虚拟网卡模式」（TUN；第一次会要求安装服务）。'
     say '  然后运行  bash setup-clash-ai.sh --verify  检查。'
-    say "  恢复原样：退出 Clash Verge，把 $backup 里的文件拷回 $VERGE_DIR（原来的时区和网络状态记在同目录的 system-state.txt 里）。"
+    say '  浏览器也要关掉 HTTP/3（chrome://flags/#enable-quic → Disabled）和安全 DNS，不然会出现切任何节点都卡或绕过分流。' "$YELLOW"
+    say "  恢复原样：退出 Clash Verge，把 $backup 里的文件拷回 $VERGE_DIR（原来的时区、IPv6 和网络状态记在同目录的 system-state.txt 里；恢复 IPv6 用 nmcli connection modify '连接名' ipv6.method auto）。"
     (( NTP_SET )) && say "  对时设置在 $NTP_DROPIN，删掉它再运行 sudo systemctl restart systemd-timesyncd 就恢复。"
     return 0
 }

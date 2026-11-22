@@ -85,27 +85,28 @@ flowchart LR
 - `--restart-clash`（仅 macOS）：由脚本退出 Clash Verge，改完再打开，不用自己去菜单栏退出。
 
 **会改什么**：
-- Clash Verge 的 `config.yaml`：关 IPv6，TUN 开启自动路由和严格路由。
+- Clash Verge 的 `config.yaml`：关 IPv6，TUN 开启自动路由、严格路由，DNS 劫持补齐 `any:53` 与 `tcp://any:53`（macOS 同时将 TUN 栈设为 `mixed`）。
 - `verge.yaml`：关 DNS 覆写、关系统代理。
 - 全局扩展覆写配置：重写。
 - 「组合配置」：新建或更新，并设为当前配置。
-- 系统：时区和自动对时；选了双出口时，还会改网卡的跃点数，并关掉 Clash 出口的 IPv6。
+- 系统：时区和自动对时，并**关闭物理网卡的 IPv6**（单出口与双出口都会关：Clash 配了 `ipv6: false` 时 TUN 不接管 `::/0`，物理网卡留着 IPv6 会导致流量绕过 Clash，一边撞墙超时卡顿、一边暴露真实地区）；选了双出口时，还会改网卡的跃点数（或网络服务顺序）。
 
 改之前会全部备份到 Clash Verge 配置目录下的 `setup-backup-时间` 文件夹，把里面的文件拷回去就能恢复。脚本不会禁用网卡，不碰订阅链接，也不替你选 AI 节点。
 
-**Windows**：PowerShell 5.1 只认带 BOM 的 UTF-8 脚本，复制粘贴会让中文变成乱码。实在要粘贴，记事本另存为时编码选「带有 BOM 的 UTF-8」。
+**Windows**：PowerShell 5.1 只认带 BOM 的 UTF-8 脚本，复制粘贴会让中文变成乱码。实在要粘贴，记事本另存为时编码选「带有 BOM 的 UTF-8」。恢复 IPv6 用 `Enable-NetAdapterBinding -Name '网卡名' -ComponentID ms_tcpip6`。
 
 **macOS**：
 - 配置目录是 `~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev`。
-- 时区用 systemsetup 设置，并关掉「根据位置自动设置时区」，不然系统会按所在地把时区改回去；对时服务器改成 ntp.aliyun.com，并开启自动对时。和现在一样的设置不会去改，都一样时不要管理员密码。
-- 双出口：macOS 没有跃点数，改的是「网络服务顺序」（默认出口排第一，Clash 出口排最后），再用 networksetup 关掉 Clash 出口那个网络服务的 IPv6。
+- 时区用 systemsetup 设置，并关掉「根据位置自动设置时区」，不然系统会按所在地把时区改回去；对时服务器改成 ntp.aliyun.com，并开启自动对时；用 networksetup 关掉物理网卡对应网络服务的 IPv6（恢复用 `sudo networksetup -setv6automatic '网络服务名'`）。和现在一样的设置不会去改，都一样时不要管理员密码。
+- TUN 栈设为 `mixed`（TCP 走系统栈、UDP 走 gVisor），比纯 `gvisor` 更少出现 macOS 下的高延迟、休眠后断流或 UDP 自环；单出口下私有域名 DNS 在 `system` 后追加了国内加密 DNS 兜底，避开 macOS TUN 接管系统 DNS 后 `system` 解析器空列表报错。
+- 双出口：macOS 没有跃点数，改的是「网络服务顺序」（默认出口排第一，Clash 出口排最后）。
 - 服务模式下内核在另一个目录里运行，实测组合配置里订阅文件的相对路径照样能读到。
-- `--verify` 比另外两版多查三项：各组选的节点、浏览器等程序用的系统 DNS 有没有被 Clash 接管、「根据位置自动设置时区」有没有关。
+- `--verify` 会额外检查：各组选的节点、系统 DNS（`dscacheutil`）有没有被 Clash 接管、IPv6 默认路由与 IPv6 DNS 残留、TUN 栈与 `tcp://any:53`、Chrome / Edge 的 QUIC 和 DoH 开关、以及「根据位置自动设置时区」有没有关。
 - macOS 版在 macOS 27 + Clash Verge Rev 2.5.8（服务模式）上实测过；双出口和需要管理员的系统设置还没在真机上跑过。
 
 **Linux**：
 - 配置目录是 `~/.local/share/io.github.clash-verge-rev.clash-verge-rev`。
-- 时区用 timedatectl 设置；对时写入 `/etc/systemd/timesyncd.conf.d/50-clash-ai.conf`，删掉它就恢复；双出口要用 NetworkManager。
+- 时区用 timedatectl 设置；对时写入 `/etc/systemd/timesyncd.conf.d/50-clash-ai.conf`，删掉它就恢复；自动关物理网卡 IPv6 和双出口依赖 NetworkManager（恢复 IPv6 用 `nmcli connection modify '连接名' ipv6.method auto`）。
 - Linux 版只在 WSL 里测过，NetworkManager 部分和 TUN 开着时的验证还没在真机上跑过。
 
 ## 双出口（可选）
@@ -124,7 +125,7 @@ flowchart LR
 
 两种模式下，脚本都会：
 - 把默认出口的跃点数设成 1、Clash 出口设成 500（macOS 上是把默认出口排在网络服务顺序的第一位，Clash 出口排最后）；
-- 关掉 Clash 出口的 IPv6，否则关 TUN 时 IPv6 流量可能从它出去；
+- 关闭物理网卡的 IPv6，避免无论 TUN 开关都有 IPv6 流量绕过 Clash 或走错出口；
 - 局域网域名用直连那一侧的 DNS 解析。
 
 Clash 出口是 Wi-Fi 时，它断开后可能自动连上别的已保存网络；不想这样，就把其他 Wi-Fi 改成手动连接。
@@ -139,8 +140,9 @@ Clash 出口是 Wi-Fi 时，它断开后可能自动连上别的已保存网络�
 | --- | --- | --- | --- |
 | 关掉安全 DNS（DoH） | 浏览器自己查 DNS 会绕过 Clash 的 DNS 分流，还可能用 ECH 把域名藏起来，Clash 就没法按域名分流 | 设置 → 隐私和安全 → 安全 →「使用安全 DNS」（Edge：隐私、搜索和服务 → 安全性） | 设置 → 隐私与安全 →「基于 HTTPS 的 DNS」选「关闭」 |
 | 限制 WebRTC | 网页能用它探测你的 IP；探测服务器在国内时，请求会直连出去，暴露真实 IP | 装 Google 的「WebRTC Network Limiter」，选「Disable non-proxied UDP」（网页视频通话可能受影响） | `about:config` 里把 `media.peerconnection.enabled` 设成 `false` |
-| 关掉 HTTP/3 | 组合配置已经拒绝它，浏览器里也关掉，就不用每次先试一下 | `chrome://flags/#enable-quic`（Edge：`edge://flags/#enable-quic`）设为 Disabled | `about:config` 里把 `network.http.http3.enable` 设成 `false` |
-| 关掉浏览器自带的 VPN 或代理 | 开着的话，出口就不是 Clash 选的节点 | 关掉这类功能和扩展 | 同左 |
+| **关掉 HTTP/3（QUIC）** | 组合配置在 TUN 里对 UDP 443 做 `REJECT`（不会回 ICMP 拒绝包）；**浏览器不关 QUIC 的话，每次打开网页都会死等 QUIC 超时才回退 TCP，表现为无论切什么节点都很卡** | `chrome://flags/#enable-quic`（Edge：`edge://flags/#enable-quic`）设为 Disabled 并重启浏览器 | `about:config` 里把 `network.http.http3.enable` 设成 `false` |
+| 关掉浏览器定位权限（**macOS 必看**） | macOS 定位服务会扫描周边 Wi-Fi 的 MAC 地址（BSSID），即使代理无泄露，Google 也能直接精准定位到所在城市 | 浏览器里拒绝位置请求；**macOS 还要在「系统设置 → 隐私与安全性 → 定位服务」关掉 Chrome / Safari 权限** | 同左 |
+| 关掉浏览器自带的 VPN 或代理 | 开着的话，出口就不是 Clash 选的节点 | 关掉这类功能和扩展（**Safari 请关掉 iCloud 专用代理和「隐藏 IP 地址」；Safari 默认开 HTTP/3，访问 AI / Google 更推荐按上表配好的 Chrome**） | 同左 |
 
 **测一遍**：开着 TUN，保持「规则」模式，用访问 AI 的那个浏览器打开下面几个网站。
 
@@ -165,8 +167,8 @@ Clash 出口是 Wi-Fi 时，它断开后可能自动连上别的已保存网络�
    ```
 
 2. **Clash Verge 设置**：
-   - TUN 设置里打开 Auto Route 和 Strict Route；用 all 模式双出口时，关掉 Auto Detect Interface。
-   - Clash 设置里关掉 IPv6 和 DNS 覆写。
+   - TUN 设置里打开 Auto Route 和 Strict Route，DNS 劫持保留 `any:53` 并补上 `tcp://any:53`（macOS 上建议把 TUN Stack 设为 `mixed`）；用 all 模式双出口时，关掉 Auto Detect Interface。
+   - Clash 设置里关掉 IPv6 和 DNS 覆写，并在操作系统里关掉活动物理网卡的 IPv6（Windows：`Disable-NetAdapterBinding -Name '网卡名' -ComponentID ms_tcpip6`；macOS：`sudo networksetup -setv6off 'Wi-Fi'`）。
    - 首页关掉系统代理。
    - 全局扩展覆写配置（`profiles\Merge.yaml`）改成：
 
@@ -205,6 +207,7 @@ Clash 出口是 Wi-Fi 时，它断开后可能自动连上别的已保存网络�
 | 刚切换完 DNS 层或 AI 层的节点 | DNS 可能还会沿用旧连接一小会儿，重新激活一下配置 |
 | 打开广告拦截后个别网页异常 | 切回 PASS |
 | Gemini 提示地区不支持，或者打不开 | Gemini 跟着「其他」层走。先确认 TUN 开着，再跑验证看「Google 认定的地区」，「其他」层别选香港这类不支持的地区。有的机场的节点被 Google 限制，地区对了也用不了，换一家机场的节点试试。以前在 TUN 关着时访问过 Gemini 的，清掉 google.com 的网站数据再登录 |
+| 无论切什么节点都很卡，或 Google 仍显示中国 / 当前城市 | 先跑一次 `--verify` / `-Verify` 重点看四项：① 物理网卡是否还留着公网 IPv6 / IPv6 默认路由 / IPv6 DNS（会绕过 IPv4 TUN 一边撞墙超时一边泄露真实城市）；② 浏览器是否关了 HTTP/3（QUIC）和安全 DNS（DoH）；③ macOS 的 TUN 栈是否为 `mixed`、系统 DNS 是否真的拿到 `198.18.x.x`；④ 看 Google 搜索页底部的来源小字：「根据你的设备」= 在 macOS 定位服务里关掉浏览器权限，「根据你的 IP 地址」= 排查 IPv6 / DNS 泄露，「根据你过去的活动记录」= 账号在手机等设备上留下的历史定位 |
 | 开着 TUN 时，有的局域网工具或其他 VPN 用不了 | 严格路由会挡掉绕开 Clash 的连接，用它们时先关 TUN |
 | Google 的大流量（YouTube、Chrome 和安卓更新）也走代理 | 这是为了不让 Google 看到真实 IP；在意流量的话，给「其他」层选一个能用 Google 的低倍率节点 |
 

@@ -19,7 +19,8 @@
 #   split = 直连流量走「默认出口」，代理流量（所有节点）走「Clash 出口」。两个出口各是哪块网卡由你选。
 #
 # 会改什么：Clash Verge 的 config.yaml / verge.yaml / profiles.yaml / 全局扩展覆写配置，新增「组合配置」；
-# 系统时区（并关掉「根据位置自动设置时区」）与网络对时服务器；选了双出口时再调整网络服务顺序、关掉 Clash 出口那个网络服务的 IPv6。
+# 系统时区（并关掉「根据位置自动设置时区」）、网络对时服务器，并关闭物理网卡对应网络服务的 IPv6（防 IPv6 绕过 Clash 导致卡顿和泄露）；
+# 选了双出口时再调整网络服务顺序。
 # 只有和现在不一样的系统设置才会去改，都一样就不要管理员密码。
 # 改之前全部备份到 Clash Verge 配置目录下的 setup-backup-时间 目录。
 # 不会做：停用任何网络服务、改订阅链接、替你选 AI 节点。
@@ -155,6 +156,27 @@ set_tun_key() {
     done
     LINES=("${LINES[@]:0:t+1}" "  $k: $v" "${LINES[@]:t+1}")
 }
+set_tun_list() {
+    local k=$1 i t=-1 end v
+    shift
+    local -a items=()
+    for v in "$@"; do items+=("  - $v"); done
+    for i in "${!LINES[@]}"; do [[ ${LINES[i]} == 'tun:' ]] && { t=$i; break; }; done
+    if (( t < 0 )); then for i in "${!LINES[@]}"; do [[ ${LINES[i]} == 'tun: {}' ]] && { LINES[i]='tun:'; t=$i; break; }; done; fi
+    if (( t < 0 )); then LINES+=('tun:'); t=$(( ${#LINES[@]} - 1 )); fi
+    for (( i = t + 1; i < ${#LINES[@]}; i++ )); do
+        [[ ${LINES[i]} == [[:space:]]* ]] || break
+        if [[ ${LINES[i]} == "  $k:"* ]]; then
+            end=$(( i + 1 ))
+            while (( end < ${#LINES[@]} )) && [[ ${LINES[end]} =~ ^[[:space:]]+-[[:space:]] ]]; do
+                end=$(( end + 1 ))
+            done
+            LINES=("${LINES[@]:0:i}" "  $k:" "${items[@]}" "${LINES[@]:end}")
+            return
+        fi
+    done
+    LINES=("${LINES[@]:0:t+1}" "  $k:" "${items[@]}" "${LINES[@]:t+1}")
+}
 
 # ───────────── 订阅与节点 ─────────────
 # 订阅列表：Clash Verge 的 profiles.yaml 里的条目（SUB_* 是同下标的几个数组）
@@ -228,6 +250,25 @@ service_of() {
         index($0, "Device: " d ")") { print s; exit }'
 }
 route_if() { route -n get "$1" 2>/dev/null | awk '$1 == "interface:" { print $2; exit }'; }
+service_ipv6_mode() { networksetup -getinfo "$1" 2>/dev/null | sed -n 's/^IPv6:[[:space:]]*//p' | head -1; }
+# 列出所有物理网卡对应的已启用网络服务（PHYS_SERVICES）和其中还没关 IPv6 的服务（V6_SERVICES）
+collect_ipv6_services() {
+    PHYS_SERVICES=() V6_SERVICES=()
+    local i s dup x m
+    list_nics
+    for i in "${!NIC_DEV[@]}"; do
+        s=$(service_of "${NIC_DEV[i]}")
+        [[ -n $s ]] || continue
+        [[ $(networksetup -getnetworkserviceenabled "$s" 2>/dev/null) == Enabled ]] || continue
+        dup=0; for x in "${PHYS_SERVICES[@]}"; do [[ $x == "$s" ]] && dup=1; done
+        (( dup )) && continue
+        PHYS_SERVICES+=("$s")
+        m=$(service_ipv6_mode "$s")
+        if [[ -n $m && $m != Off && $m != Link-local* ]]; then
+            V6_SERVICES+=("$s")
+        fi
+    done
+}
 # 网卡的 DNS：DHCP 给的 → 退而求其次用网关
 detect_dns() {
     local d
@@ -270,11 +311,28 @@ test_split_exit() {
     done
 }
 verify() {
-    local ok=0 bad=0 c a d i n l tun_if mode='' clash_if='' def_if='' before=0 dev listen sent w gl v6 v6svc now dual_text=否
+    local ok=0 bad=0 c a d i n l tun_if mode='' clash_if='' def_if='' before=0 dev listen sent w gl v6 v6svc v6rt v6dns tun_stack now dual_text=否
     mark() {
         local color
-        case $1 in 通过) color=$GREEN; ok=$(( ok + 1 )) ;; 失败) color=$RED; bad=$(( bad + 1 )) ;; 跳过) color=$YELLOW ;; *) color=$CYAN ;; esac
+        case $1 in 通过) color=$GREEN; ok=$(( ok + 1 )) ;; 失败) color=$RED; bad=$(( bad + 1 )) ;; 跳过|提醒) color=$YELLOW ;; *) color=$CYAN ;; esac
         say "[$1] $2  $3" "$color"
+    }
+    check_chromium_browser() {
+        local name=$1 state=$2 scheme=$3 res q d
+        [[ -f $state ]] || return 0
+        command -v perl >/dev/null 2>&1 || return 0
+        res=$(perl -MJSON::PP -0777 -e '
+            my $j = eval { decode_json(<STDIN>) } or exit 1;
+            my $labs = $j->{browser}{enabled_labs_experiments} || [];
+            my $q = (grep { $_ eq "enable-quic\@2" } @$labs) ? "off" : "on";
+            my $d = $j->{dns_over_https}{mode} // "automatic";
+            print "$q $d\n";
+        ' < "$state" 2>/dev/null) || return 0
+        q=${res%% *}; d=${res#* }
+        if [[ $q == off ]]; then mark 通过 "${name} 已关 HTTP/3（QUIC）" 'enable-quic = Disabled'
+        else mark 提醒 "${name} 还没关 HTTP/3（QUIC）" "TUN 会静默丢弃 UDP 443，不关会导致无论切什么节点都很卡：打开 ${scheme}://flags/#enable-quic 设为 Disabled 并重启浏览器"; fi
+        if [[ $d == off ]]; then mark 通过 "${name} 已关安全 DNS（DoH）" 'dns_over_https = off'
+        else mark 提醒 "${name} 还没关安全 DNS（DoH）" "当前模式为 ${d}，会绕过 Clash 的 Fake-IP：到浏览器设置关闭「使用安全 DNS」"; fi
     }
     trace() { curl -s -m 15 "$1" 2>/dev/null; }
     kv() { sed -n "s/^$1=//p" <<< "$2" | head -1; }
@@ -351,22 +409,47 @@ verify() {
             fi
         fi
     fi
-    # 组合配置只走 IPv4：物理网卡上有公网 IPv6 时，IPv6 流量和网页的 WebRTC 可能绕过 Clash
-    v6=''
+    # 组合配置只走 IPv4：物理网卡上有公网 IPv6、IPv6 默认路由或 IPv6 DNS 时，流量可能绕过 Clash 导致卡顿与真实 IP 泄露
+    v6='' v6rt='' v6dns=''
     list_nics
     for i in "${!NIC_DEV[@]}"; do
         ifconfig "${NIC_DEV[i]}" 2>/dev/null | awk '$1 == "inet6" { print $2 }' | grep -qE '^[23]' && { v6=${NIC_DEV[i]}; break; }
     done
+    v6rt=$(route -n get -inet6 2001:4860:4860::8888 2>/dev/null | awk '$1 == "interface:" { print $2; exit }')
+    [[ $v6rt == utun* ]] && v6rt=''
+    v6dns=$(scutil --dns 2>/dev/null | awk '/nameserver\[[0-9]+\] : [0-9a-fA-F]*:/ { print $3 }' | grep -vE '^(::1|fe80:)' | head -1)
     if [[ -n $v6 ]]; then
         v6svc=$(service_of "$v6")
-        mark 失败 '没有绕过 Clash 的 IPv6' "$v6 有公网 IPv6，IPv6 流量可能绕过 Clash。关掉它：sudo networksetup -setv6off '${v6svc:-网络服务名}'"
+        mark 失败 '没有绕过 Clash 的 IPv6' "$v6 有公网 IPv6，流量会绕过 Clash 导致卡顿与真实地区泄露。关掉它：sudo networksetup -setv6off '${v6svc:-网络服务名}'"
+    elif [[ -n $v6rt ]]; then
+        v6svc=$(service_of "$v6rt")
+        mark 失败 '没有绕过 Clash 的 IPv6' "存在经 $v6rt 出去的 IPv6 默认路由，可能绕过 Clash。关掉它：sudo networksetup -setv6off '${v6svc:-网络服务名}'"
+    elif [[ -n $v6dns ]]; then
+        mark 失败 '没有绕过 Clash 的 IPv6' "系统 DNS 里还有 IPv6 服务器（$v6dns），可能绕过 IPv4 TUN。请对当前网络服务执行：sudo networksetup -setv6off 'Wi-Fi'"
     else
-        mark 通过 '没有绕过 Clash 的 IPv6' '物理网卡上都没有公网 IPv6'
+        mark 通过 '没有绕过 Clash 的 IPv6' '无公网 IPv6、无 IPv6 默认路由、无 IPv6 DNS'
     fi
     listen=$(netstat -anv -p udp 2>/dev/null | awk '$4 ~ /[.:]1053$/ { print $4 }')
     if [[ -z $listen ]]; then mark 跳过 'DNS 只监听本机' 'Clash 没在运行'
     elif ! grep -vqE '^127\.0\.0\.1[.:]1053$' <<< "$listen"; then mark 通过 'DNS 只监听本机' '只有 127.0.0.1:1053'
     else mark 失败 'DNS 只监听本机' "$(tr '\n' ' ' <<< "$listen")"; fi
+    # 检查 macOS TUN 栈和 TCP 53 劫持
+    if [[ -f $VERGE_DIR/config.yaml ]]; then
+        tun_stack=$(awk '/^tun:/ { f=1; next } f && /^[^[:space:]]/ { f=0 } f && /^  stack:/ { print $2; exit }' "$VERGE_DIR/config.yaml" 2>/dev/null)
+        if [[ $tun_stack == gvisor ]]; then
+            mark 提醒 'macOS TUN 协议栈' '当前是 gvisor；macOS 上容易出现高延迟、休眠后断流或 UDP 自环，建议重新运行脚本改用 mixed'
+        elif [[ -n $tun_stack ]]; then
+            mark 通过 'macOS TUN 协议栈' "$tun_stack"
+        fi
+        if grep -q 'tcp://any:53' "$VERGE_DIR/config.yaml" 2>/dev/null; then
+            mark 通过 'TUN DNS 劫持含 TCP 53' 'any:53 + tcp://any:53'
+        else
+            mark 提醒 'TUN DNS 劫持缺 TCP 53' 'config.yaml 缺少 tcp://any:53，重新运行脚本可补上'
+        fi
+    fi
+    # 检查已安装的 Chromium 浏览器是否关了 QUIC 和 DoH（不关会导致全节点卡顿或绕过 Fake-IP）
+    check_chromium_browser Chrome "$HOME/Library/Application Support/Google/Chrome/Local State" chrome
+    check_chromium_browser Edge "$HOME/Library/Application Support/Microsoft Edge/Local State" edge
     # macOS 会按位置自动改时区，开着的话之前设好的时区会被改回去
     if [[ $(defaults read /Library/Preferences/com.apple.timezone.auto Active 2>/dev/null) == 1 ]]; then
         mark 失败 '时区不会被自动改掉' "「根据位置自动设置时区」开着，现在是 $(current_timezone)。关掉它：sudo defaults write /Library/Preferences/com.apple.timezone.auto Active -bool false"
@@ -375,6 +458,7 @@ verify() {
     fi
     say ''
     say "通过 $ok 项，失败 $bad 项。失效保护需要手动测：AI 组临时选「拒绝」，claude.ai 应该打不开。" "$( (( bad )) && echo "$RED" || echo "$GREEN")"
+    say '提示：若 Google 搜索仍显示真实城市，看页面底部来源小字：「根据你的设备」= 在「系统设置 → 隐私与安全性 → 定位服务」关掉浏览器的定位权限（防 Wi-Fi 周边定位）；用 Safari 时请关掉 iCloud 专用代理和 HTTP/3。' "$CYAN"
     (( bad == 0 ))
 }
 
@@ -542,7 +626,8 @@ rule-providers:
     proxy: 其他
 
 rules:
-  # HTTP/3（QUIC）一律拒绝，浏览器会立刻改用普通 HTTPS：出口更一致，域名识别更准。
+  # HTTP/3（QUIC）一律拒绝，强制改用普通 HTTPS：出口更一致，域名识别更准。
+  # 注意：TUN 对 UDP 的 REJECT 不会回 ICMP 拒绝包，浏览器也要顺手关掉 QUIC，否则每次连接会等超时才回退。
   - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT
   # Google 整个走「其他」，包括 Gemini、AI Studio 和 Google 登录：Google 按账号判断地区，同一个账号的请求要从同一个出口出去；
   # 上游还把 Google 一部分国内能连的域名放进了直连，会带着账号 Cookie 暴露真实 IP。所以「其他」层要选一个能正常用 Google 的节点。
@@ -591,6 +676,7 @@ dns:
     - 'time.*.com'
     - 'time.*.gov'
     - 'time.*.edu.cn'
+    - 'time.apple.com'
     - 'time.*.apple.com'
     - 'time1.*.com'
     - 'time2.*.com'
@@ -610,9 +696,10 @@ dns:
     - '*.time.edu.cn'
     - '*.ntp.org.cn'
     - 'time1.cloud.tencent.com'
-    # Windows 联网检测：拿到假 IP 会让任务栏显示「无 Internet」
+    # Windows / macOS 联网检测：拿到假 IP 会让系统误判「无 Internet」或反复弹认证页
     - '*.msftconnecttest.com'
     - '*.msftncsi.com'
+    - 'captive.apple.com'
     # STUN：网页通话、P2P 穿透要用真实地址
     - 'stun.*.*'
     - 'stun.*.*.*'
@@ -695,13 +782,30 @@ set_ntp() {
         say "自动对时没设好：在「系统设置 → 通用 → 日期与时间」里打开「自动设置时间和日期」，来源填 $NTP_SERVER" "$YELLOW"
     fi
 }
-# 双出口：macOS 按「网络服务顺序」选默认路由（相当于跃点数）：默认出口排第一，Clash 出口排最后；再关掉 Clash 出口的 IPv6
+# 组合配置只走 IPv4（ipv6: false），TUN 不接管 ::/0；物理网卡留着 IPv6 会导致流量绕过 Clash（撞墙超时卡顿 + 真实 IPv6 泄露）
+disable_ipv6_services() {
+    local s
+    if (( ${#V6_SERVICES[@]} == 0 )); then
+        say '物理网卡的 IPv6 已经关闭（或仅本地链接）'
+        return 0
+    fi
+    for s in "${V6_SERVICES[@]}"; do
+        if "${SUDO[@]}" networksetup -setv6off "$s" >/dev/null 2>&1; then
+            say "已关闭「${s}」的 IPv6（防绕过 Clash 泄露与超时卡顿）"
+        elif "${SUDO[@]}" networksetup -setv6linklocal "$s" >/dev/null 2>&1; then
+            say "已将「${s}」的 IPv6 设为仅本地链接（防公网 IPv6 绕过 Clash）"
+        else
+            say "没关掉「${s}」的 IPv6，请手动运行：sudo networksetup -setv6off '${s}'" "$YELLOW"
+        fi
+    done
+}
+# 双出口：macOS 按「网络服务顺序」选默认路由（相当于跃点数）：默认出口排第一，Clash 出口排最后
 set_dual_exit_network() {
     local def_svc clash_svc s
     local -a order=()
     def_svc=$(service_of "$DEFAULT_IF"); clash_svc=$(service_of "$CLASH_IF")
     if [[ -z $def_svc || -z $clash_svc ]]; then
-        say "没找到「${DEFAULT_IF}」或「${CLASH_IF}」对应的网络服务，双出口的网络设置要手动做：在「系统设置 → 网络」的服务顺序里把默认出口排第一、Clash 出口排最后，并关掉 Clash 出口的 IPv6。" "$YELLOW"
+        say "没找到「${DEFAULT_IF}」或「${CLASH_IF}」对应的网络服务，双出口的网络设置要手动做：在「系统设置 → 网络」的服务顺序里把默认出口排第一、Clash 出口排最后。" "$YELLOW"
         return 0
     fi
     order=("$def_svc")
@@ -714,11 +818,6 @@ set_dual_exit_network() {
         say "双出口：网络服务顺序改为 $(join_by ' > ' "${order[@]}")"
     else
         say "没改成网络服务顺序，请在「系统设置 → 网络 → 设定服务顺序」里把「${def_svc}」排第一、「${clash_svc}」排最后" "$YELLOW"
-    fi
-    if "${SUDO[@]}" networksetup -setv6off "$clash_svc"; then
-        say "已关闭「${clash_svc}」的 IPv6"
-    else
-        say "没关掉「${clash_svc}」的 IPv6，请在「系统设置 → 网络 → $clash_svc → 详细信息 → TCP/IP」里把「配置 IPv6」设为「仅本地链接」" "$YELLOW"
     fi
 }
 
@@ -890,11 +989,13 @@ main() {
     fi
 
     # 系统设置里哪些要改：和现在一样的不动，一样都不用改就不要管理员密码
-    local need_tz=0 need_ntp=0 cur_ntp
+    local need_tz=0 need_ntp=0 need_v6=0 cur_ntp
     cur_ntp=$(current_ntp)
+    collect_ipv6_services
     if (( ! SKIP_SYSTEM )); then
         [[ $TIMEZONE != skip ]] && { [[ $(current_timezone) != "$TIMEZONE" ]] || auto_timezone_on; } && need_tz=1
         [[ $cur_ntp != "$NTP_SERVER" ]] && need_ntp=1
+        (( ${#V6_SERVICES[@]} )) && need_v6=1
     fi
 
     # 汇总
@@ -911,8 +1012,9 @@ main() {
         local -a sys_text=()
         (( need_tz )) && sys_text+=("时区（现在 $(current_timezone)$(auto_timezone_on && echo '，开着自动设置时区')）")
         (( need_ntp )) && sys_text+=("对时服务器（现在 ${cur_ntp:-没设}，改成 ${NTP_SERVER}）")
-        [[ $DUAL_EXIT != no ]] && sys_text+=('网络服务顺序和 Clash 出口的 IPv6')
-        if (( ${#sys_text[@]} )); then say "  系统设置要改：$(join_by '、' "${sys_text[@]}")"; else say '  系统设置：时区和对时都已经是要的设置，不用改'; fi
+        (( need_v6 )) && sys_text+=("关闭物理网卡 IPv6（$(join_by '、' "${V6_SERVICES[@]}")）")
+        [[ $DUAL_EXIT != no ]] && sys_text+=('双出口网络服务顺序')
+        if (( ${#sys_text[@]} )); then say "  系统设置要改：$(join_by '、' "${sys_text[@]}")"; else say '  系统设置：时区、对时和 IPv6 都已经是要的设置，不用改'; fi
     fi
     if (( ! DRY_RUN && ! YES )); then
         say '  执行时需要先退出 Clash Verge；退出期间 TUN 会断开，所有流量（包括 AI）都会直连。' "$YELLOW"
@@ -933,7 +1035,8 @@ main() {
         quoted+=("$(yq "$k")")
     done
     use="[$(join_by ', ' "${quoted[@]}")]"
-    if [[ $DUAL_EXIT != no ]]; then private_dns=$(yq "$LAN_DNS"); else private_dns="'system'"; fi
+    # 单出口下给 system 加国内加密 DNS 兜底：macOS TUN 接管系统 DNS 后 Mihomo 可能把 system 解析器清为空列表
+    if [[ $DUAL_EXIT != no ]]; then private_dns=$(yq "$LAN_DNS"); else private_dns="'system', 'https://223.5.5.5/dns-query', 'https://1.12.12.12/dns-query'"; fi
     if [[ $ADBLOCK == on ]]; then ad_proxies='[REJECT, PASS]'; else ad_proxies='[PASS, REJECT]'; fi
     local ai_filter ai_exclude
     ai_filter=$(yq "$(join_by '|' "${ai_parts[@]}")"); ai_exclude=$(yq "$BLOCK_AI")
@@ -976,9 +1079,9 @@ main() {
 
     # 需要管理员的步骤先拿到 sudo，拿不到就什么都不改（放在退出 Clash Verge 之前，免得输密码时一直断着代理）
     SUDO=()
-    if (( need_tz || need_ntp )) || [[ $DUAL_EXIT != no && $SKIP_SYSTEM == 0 ]]; then
+    if (( need_tz || need_ntp || need_v6 )) || [[ $DUAL_EXIT != no && $SKIP_SYSTEM == 0 ]]; then
         if (( EUID != 0 )); then
-            say '改时区、对时（和双出口的网络设置）需要管理员权限，下面可能要你输入开机密码。'
+            say '改时区、对时、关闭物理网卡 IPv6（或双出口网络顺序）需要管理员权限，下面可能要你输入开机密码。'
             sudo -v || die '没拿到管理员权限，什么都没改。只想改 Clash 就加 --skip-system。'
             SUDO=(sudo)
         fi
@@ -1035,30 +1138,32 @@ main() {
         echo "# 根据位置自动设置时区（1 = 开）"; defaults read /Library/Preferences/com.apple.timezone.auto Active 2>/dev/null
         echo "# /etc/ntp.conf"; cat /etc/ntp.conf 2>/dev/null
         echo "# 网络服务顺序"; networksetup -listnetworkserviceorder 2>/dev/null
-        if [[ $DUAL_EXIT != no ]]; then
-            for k in "$DEFAULT_IF" "$CLASH_IF"; do
-                n=$(service_of "$k"); [[ -n $n ]] && { echo "# 网络服务「${n}」（${k}）"; networksetup -getinfo "$n" 2>/dev/null; }
-            done
-        fi
+        for k in "${PHYS_SERVICES[@]}"; do
+            echo "# 网络服务「${k}」"; networksetup -getinfo "$k" 2>/dev/null
+        done
         echo "# 网卡地址"; ifconfig 2>/dev/null
         echo "# 路由"; netstat -rn 2>/dev/null
     } > "$backup/system-state.txt" 2>&1
     say "已备份到 $backup" "$GREEN"
 
-    # 系统：时区、对时、双出口的网络设置
+    # 系统：时区、对时、关闭物理网卡 IPv6、双出口的网络设置
     if (( SKIP_SYSTEM )); then
         say '按 --skip-system 跳过时区、对时和网络设置' "$YELLOW"
     else
         if (( need_tz )); then set_timezone; elif [[ $TIMEZONE != skip ]]; then say "时区已经是 $TIMEZONE"; fi
         if (( need_ntp )); then set_ntp; else say "对时服务器已经是 $NTP_SERVER"; fi
+        disable_ipv6_services
         if [[ $DUAL_EXIT != no ]]; then set_dual_exit_network; fi
     fi
 
     # Clash Verge 基础设置：config.yaml
+    # macOS 上用 mixed 栈（TCP 走系统栈、UDP 走 gVisor），比纯 gVisor 更少卡顿和休眠断流；同时劫持 UDP + TCP 53 端口
     load_lines "$VERGE_DIR/config.yaml"
     set_top_key ipv6 false
+    set_tun_key stack mixed
     set_tun_key auto-route true
     set_tun_key strict-route true
+    set_tun_list dns-hijack any:53 'tcp://any:53'
     if [[ $DUAL_EXIT == all ]]; then set_tun_key auto-detect-interface false; else set_tun_key auto-detect-interface true; fi
     save_lines "$VERGE_DIR/config.yaml" || die '写 config.yaml 失败。'
 
@@ -1134,7 +1239,8 @@ main() {
     if ifconfig 2>/dev/null | grep -q 'inet 198\.18\.0\.1 '; then say '  3. 确认首页的「虚拟网卡模式」（TUN）开着（现在是开的）。'
     else say '  3. 回首页打开「虚拟网卡模式」（TUN；第一次会要求安装服务）。'; fi
     say '  然后运行  bash setup-clash-ai-macos.sh --verify  检查。'
-    say "  恢复原样：退出 Clash Verge，把 $backup 里的文件拷回 ${VERGE_DIR}（原来的时区、对时和网络服务顺序记在同目录的 system-state.txt 里）。"
+    say '  浏览器也要关掉 HTTP/3（chrome://flags/#enable-quic → Disabled）和安全 DNS，并在「系统设置 → 隐私与安全性 → 定位服务」关掉浏览器的定位权限。' "$YELLOW"
+    say "  恢复原样：退出 Clash Verge，把 $backup 里的文件拷回 ${VERGE_DIR}（原来的时区、对时、IPv6 和网络服务顺序记在同目录的 system-state.txt 里；恢复 IPv6 用 sudo networksetup -setv6automatic '网络服务名'）。"
     return 0
 }
 
