@@ -124,6 +124,9 @@ flowchart LR
 | 局限 | 国内网站和局域网也走 Clash 出口，用热点时会耗流量；开着 TUN 时，访问不到默认出口那边的局域网设备 | 默认出口那边的网络能看到你访问了哪些国内网站，以及你在用阿里 / 腾讯的 DoH（看不到代理流量）；默认出口断了，直连会改走 Clash 出口 |
 
 两种模式下，脚本都会：
+- 关掉 TUN 的 `auto-detect-interface`，改为**显式绑定物理网卡**（避免 Windows / macOS / Linux 在多物理网卡或 Hyper-V / VMware / Docker / VPN 虚拟网卡共存时自动探测错乱导致直连卡死）：
+  - `all` 模式：全局 `interface-name` 绑死在 Clash 出口；
+  - `split` 模式：全局 `interface-name` 绑在默认出口兜底，节点来源 `override.interface-name` 绑在 Clash 出口，并新增「直连」`fallback` 策略组（`直连-默认` → `直连-备用`，每 15 秒探测，默认出口断线自动切 Clash 出口、恢复后自动切回），同时代理节点域名解析固定走 `直连-备用`；
 - 把默认出口的跃点数设成 1、Clash 出口设成 500（macOS 上是把默认出口排在网络服务顺序的第一位，Clash 出口排最后）；
 - 关闭物理网卡的 IPv6，避免无论 TUN 开关都有 IPv6 流量绕过 Clash 或走错出口；
 - 局域网域名用直连那一侧的 DNS 解析。
@@ -167,7 +170,7 @@ Clash 出口是 Wi-Fi 时，它断开后可能自动连上别的已保存网络�
    ```
 
 2. **Clash Verge 设置**：
-   - TUN 设置里打开 Auto Route 和 Strict Route，DNS 劫持保留 `any:53` 并补上 `tcp://any:53`（macOS 上建议把 TUN Stack 设为 `mixed`）；用 all 模式双出口时，关掉 Auto Detect Interface。
+   - TUN 设置里打开 Auto Route 和 Strict Route，DNS 劫持保留 `any:53` 并补上 `tcp://any:53`（macOS 上建议把 TUN Stack 设为 `mixed`）；用双出口（`all` 或 `split`）时，关掉 Auto Detect Interface。
    - Clash 设置里关掉 IPv6 和 DNS 覆写，并在操作系统里关掉活动物理网卡的 IPv6（Windows：`Disable-NetAdapterBinding -Name '网卡名' -ComponentID ms_tcpip6`；macOS：`sudo networksetup -setv6off 'Wi-Fi'`）。
    - 首页关掉系统代理。
    - 全局扩展覆写配置（`profiles\Merge.yaml`）改成：
@@ -187,7 +190,7 @@ Clash 出口是 Wi-Fi 时，它断开后可能自动连上别的已保存网络�
 4. **选节点、开 TUN**：和快速开始第 3 步一样。
 5. **双出口**（可选）：
    - all 模式：在全局扩展覆写配置里加一行 `interface-name: Clash 出口的网卡名`。
-   - split 模式：在组合配置每个节点来源的 `override` 下面各加一行 `interface-name: 网卡名`。
+   - split 模式：在全局扩展覆写配置里加一行 `interface-name: 默认出口的网卡名`（配合关闭 Auto Detect Interface）；在组合配置里加 `直连-默认` / `直连-备用` 两个 `type: direct` 节点和「直连」`fallback` 组（把规则里的 `DIRECT` 改成 `直连`，国内 DoH 加 `#直连`、`proxy-server-nameserver` 加 `#直连-备用`），并在每个节点来源的 `override` 下面各加一行 `interface-name: Clash 出口的网卡名`。
    - 两种模式都要把 DNS 规则表里的 `'rule-set:loyal-private'` 改成直连那一侧网卡的 DNS，并设好跃点数、关掉 Clash 出口的 IPv6：
 
      ```powershell

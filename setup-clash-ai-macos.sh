@@ -446,6 +446,13 @@ verify() {
         else
             mark 提醒 'TUN DNS 劫持缺 TCP 53' 'config.yaml 缺少 tcp://any:53，重新运行脚本可补上'
         fi
+        if [[ -n $mode ]]; then
+            if grep -Eq '^  auto-detect-interface:[[:space:]]*false([[:space:]]|$)' "$VERGE_DIR/config.yaml" 2>/dev/null; then
+                mark 通过 '双出口已关闭自动探测出口' 'auto-detect-interface = false（使用显式网卡绑定）'
+            else
+                mark 失败 '双出口已关闭自动探测出口' 'config.yaml 里 auto-detect-interface 不是 false；多网卡下易选错出口导致直连卡死，请到 TUN 设置关闭「自动选择流量出口接口」'
+            fi
+        fi
     fi
     # 检查已安装的 Chromium 浏览器是否关了 QUIC 和 DoH（不关会导致全节点卡顿或绕过 Fake-IP）
     check_chromium_browser Chrome "$HOME/Library/Application Support/Google/Chrome/Local State" chrome
@@ -475,7 +482,7 @@ profile:
   store-selected: true
   store-fake-ip: true
 
-proxy-providers:
+{{SPLIT_PROXIES}}proxy-providers:
 {{PROVIDERS}}
 proxy-groups:
   # AI 层：第一项是「拒绝」，没选过或选中的节点消失时直接断开，不会悄悄换出口。
@@ -502,6 +509,7 @@ proxy-groups:
     type: select
     proxies: [其他, AI]
     use: {{USE}}
+{{SPLIT_GROUP}}
 
 rule-providers:
   ai-inline:
@@ -643,15 +651,15 @@ rules:
   - IP-CIDR6,2607:6bc0::/32,AI,no-resolve
   - IP-ASN,399358,AI,no-resolve
   # 通用规则：Loyalsoldier。
-  - RULE-SET,loyal-private,DIRECT
+  - RULE-SET,loyal-private,{{DIRECT_TARGET}}
   - RULE-SET,loyal-reject,广告拦截
   # 必应整个走「其他」：上游把它一部分国内能连的域名放进了直连，这些请求会带着账号 Cookie 从你的真实 IP 出去。
   - DOMAIN-SUFFIX,bing.com,其他
   - RULE-SET,loyal-proxy,其他
-  - RULE-SET,loyal-direct,DIRECT
-  - RULE-SET,loyal-lancidr,DIRECT,no-resolve
+  - RULE-SET,loyal-direct,{{DIRECT_TARGET}}
+  - RULE-SET,loyal-lancidr,{{DIRECT_TARGET}},no-resolve
   - RULE-SET,loyal-telegramcidr,其他,no-resolve
-  - RULE-SET,loyal-cncidr,DIRECT
+  - RULE-SET,loyal-cncidr,{{DIRECT_TARGET}}
   - MATCH,其他
 
 dns:
@@ -706,9 +714,9 @@ dns:
     # QQ 快捷登录：必须解析到 127.0.0.1
     - 'localhost.ptlogin2.qq.com'
   default-nameserver: [223.5.5.5, 119.29.29.29]
-  # 固定例外：代理节点自身的地址，直连国内加密 DNS（阿里 + 腾讯）。
-  proxy-server-nameserver: ['https://223.5.5.5/dns-query', 'https://1.12.12.12/dns-query']
-  direct-nameserver: ['https://223.5.5.5/dns-query', 'https://1.12.12.12/dns-query']
+  # 固定例外：代理节点自身的地址，直连国内加密 DNS（阿里 + 腾讯）；split 模式下经 Clash 出口解析，避免默认出口断线影响节点。
+  proxy-server-nameserver: {{PROXY_DNS}}
+  direct-nameserver: {{DIRECT_DNS}}
   direct-nameserver-follow-policy: true
   # 其余所有域名：经 DNS 层节点查境外 DoH。
   nameserver: ['https://1.1.1.1/dns-query#DNS', 'https://8.8.8.8/dns-query#DNS']
@@ -721,7 +729,7 @@ dns:
     # 2. 局域网、私有域名
     'rule-set:loyal-private': [{{PRIVATE_DNS}}]
     # 3. 国内域名 → 国内加密 DNS 直连
-    'rule-set:loyal-direct': ['https://223.5.5.5/dns-query', 'https://1.12.12.12/dns-query']
+    'rule-set:loyal-direct': {{DIRECT_DNS}}
 
 sniffer:
   enable: true
@@ -1024,12 +1032,15 @@ main() {
 
     # 生成组合配置
     local prov='' block use private_dns ad_proxies profile
+    local split_proxies='' split_group='' direct_target='DIRECT'
+    local proxy_dns="['https://223.5.5.5/dns-query', 'https://1.12.12.12/dns-query']"
+    local direct_dns="['https://223.5.5.5/dns-query', 'https://1.12.12.12/dns-query']"
     local -a quoted=()
     for p in "${!CHOSEN[@]}"; do
         i=${CHOSEN[p]} k=${KEYS[p]}
         printf -v block "  %s:\n    type: file\n    path: %s\n    interval: 3600\n    exclude-filter: %s\n    exclude-type: 'direct'\n    override:\n      additional-prefix: %s\n" \
             "$(yq "$k")" "$(yq "./profiles/${SUB_FILE[i]}")" "$(yq "$INFO_FILTER")" "$(yq "[$k] ")"
-        # split：只有节点连接绑在 Clash 出口上，直连照常走系统默认出口
+        # split：节点连接显式绑在 Clash 出口上，直连通过「直连」fallback 组优先走默认出口、断线自动切 Clash 出口（不依赖 auto-detect-interface）
         [[ $DUAL_EXIT == split ]] && block+="      interface-name: $(yq "$CLASH_IF")"$'\n'
         prov+=$block
         quoted+=("$(yq "$k")")
@@ -1038,14 +1049,27 @@ main() {
     # 单出口下给 system 加国内加密 DNS 兜底：macOS TUN 接管系统 DNS 后 Mihomo 可能把 system 解析器清为空列表
     if [[ $DUAL_EXIT != no ]]; then private_dns=$(yq "$LAN_DNS"); else private_dns="'system', 'https://223.5.5.5/dns-query', 'https://1.12.12.12/dns-query'"; fi
     if [[ $ADBLOCK == on ]]; then ad_proxies='[REJECT, PASS]'; else ad_proxies='[PASS, REJECT]'; fi
+    if [[ $DUAL_EXIT == split ]]; then
+        printf -v split_proxies "# 双出口 split：显式双网卡直连出口，供「直连」fallback 组使用（不依赖 auto-detect-interface）。\nproxies:\n  - name: 直连-默认\n    type: direct\n    interface-name: %s\n  - name: 直连-备用\n    type: direct\n    interface-name: %s\n\n" \
+            "$(yq "$DEFAULT_IF")" "$(yq "$CLASH_IF")"
+        printf -v split_group "  # 直连层：默认走「默认出口」，默认出口断线后自动 fallback 到「Clash 出口」，恢复后自动切回。\n  - name: 直连\n    type: fallback\n    proxies: [直连-默认, 直连-备用]\n    url: http://connectivitycheck.platform.hicloud.com/generate_204\n    interval: 15\n"
+        direct_target='直连'
+        proxy_dns="['https://223.5.5.5/dns-query#直连-备用', 'https://1.12.12.12/dns-query#直连-备用']"
+        direct_dns="['https://223.5.5.5/dns-query#直连', 'https://1.12.12.12/dns-query#直连']"
+    fi
     local ai_filter ai_exclude
     ai_filter=$(yq "$(join_by '|' "${ai_parts[@]}")"); ai_exclude=$(yq "$BLOCK_AI")
     profile=$TEMPLATE
+    profile=${profile//'{{SPLIT_PROXIES}}'/$split_proxies}
     profile=${profile//'{{PROVIDERS}}'/$prov}
     profile=${profile//'{{USE}}'/$use}
     profile=${profile//'{{AI_FILTER}}'/$ai_filter}
     profile=${profile//'{{AI_EXCLUDE}}'/$ai_exclude}
     profile=${profile//'{{AD_PROXIES}}'/$ad_proxies}
+    profile=${profile//'{{SPLIT_GROUP}}'/$split_group}
+    profile=${profile//'{{DIRECT_TARGET}}'/$direct_target}
+    profile=${profile//'{{PROXY_DNS}}'/$proxy_dns}
+    profile=${profile//'{{DIRECT_DNS}}'/$direct_dns}
     profile=${profile//'{{PRIVATE_DNS}}'/$private_dns}
 
     # 用内核检查生成的配置
@@ -1164,7 +1188,7 @@ main() {
     set_tun_key auto-route true
     set_tun_key strict-route true
     set_tun_list dns-hijack any:53 'tcp://any:53'
-    if [[ $DUAL_EXIT == all ]]; then set_tun_key auto-detect-interface false; else set_tun_key auto-detect-interface true; fi
+    if [[ $DUAL_EXIT != no ]]; then set_tun_key auto-detect-interface false; else set_tun_key auto-detect-interface true; fi
     save_lines "$VERGE_DIR/config.yaml" || die '写 config.yaml 失败。'
 
     # verge.yaml：关 DNS 覆写、关系统代理
@@ -1181,7 +1205,8 @@ main() {
     {
         printf '# 由 setup-clash-ai-macos.sh 生成（原文件已备份）\nprofile:\n  store-selected: true\n  store-fake-ip: true\n'
         if [[ $DUAL_EXIT != no ]]; then printf '# 双出口的设置（--verify 读这一行，别改）\n# setup-clash-ai dual-exit: mode=%s; clash=%s; default=%s\n' "$DUAL_EXIT" "$CLASH_IF" "$DEFAULT_IF"; fi
-        if [[ $DUAL_EXIT == all ]]; then printf '# 双出口 all：Clash 的所有出站都从这块网卡出去\ninterface-name: %s\n' "$CLASH_IF"; fi
+        if [[ $DUAL_EXIT == all ]]; then printf '# 双出口 all：Clash 的所有出站都从这块网卡出去\ninterface-name: %s\n' "$CLASH_IF"
+        elif [[ $DUAL_EXIT == split ]]; then printf '# 双出口 split：显式默认出口（配合关闭 auto-detect-interface，避免多网卡探测错乱；代理节点与「直连」fallback 组会按需覆盖）\ninterface-name: %s\n' "$DEFAULT_IF"; fi
     } > "$merge_path" || die '写全局扩展覆写配置失败。'
     gs=$VERGE_DIR/profiles/Script.js
     if [[ -f $gs && $(grep -v '^[[:space:]]*//' "$gs" | tr -d '[:space:]') != 'functionmain(config,profileName){returnconfig;}' ]]; then
